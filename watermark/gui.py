@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tkinter as tk
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -39,8 +41,73 @@ SCALE_DEBOUNCE_MS = 250
 NAV_DEBOUNCE_MS = 120
 CAROUSEL_WIDTH = 196
 THUMB_MAX = (160, 110)
+PREVIEW_MAX = 1200
+PREVIEW_CACHE_BYTES = 512 * 1024 * 1024
 ITEM_BG = '#f0f0f0'
 ITEM_SEL_BG = '#cfe3ff'
+
+
+@dataclass
+class ImageItem:
+    path: Path
+    position: str = 'bottom-right'
+    scale: float = core.DEFAULT_SCALE
+    width: int = 0
+    height: int = 0
+    base_preview: Image.Image | None = None
+    preview: Image.Image | None = None
+    preview_key: tuple | None = None
+    thumb: ImageTk.PhotoImage | None = None
+
+    def cached_bytes(self) -> int:
+        total = 0
+        if self.base_preview is not None:
+            total += self.base_preview.width * self.base_preview.height * 4
+        if self.preview is not None:
+            total += self.preview.width * self.preview.height * 3
+        return total
+
+    def drop_composite(self) -> None:
+        self.preview = None
+        self.preview_key = None
+
+    def drop_preview(self) -> None:
+        self.base_preview = None
+        self.preview = None
+        self.preview_key = None
+
+
+class PreviewCache:
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.total = 0
+        self._lru: 'OrderedDict[Path, tuple[ImageItem, int]]' = OrderedDict()
+
+    def touch(self, item: ImageItem) -> None:
+        previous = self._lru.pop(item.path, None)
+        if previous is not None:
+            self.total -= previous[1]
+        size = item.cached_bytes()
+        self._lru[item.path] = (item, size)
+        self.total += size
+        self._evict()
+
+    def remove(self, item: ImageItem) -> None:
+        previous = self._lru.pop(item.path, None)
+        if previous is not None:
+            self.total -= previous[1]
+
+    def clear(self) -> None:
+        for item, _size in self._lru.values():
+            item.drop_preview()
+        self._lru.clear()
+        self.total = 0
+
+    def _evict(self) -> None:
+        while self.total > self.max_bytes and len(self._lru) > 1:
+            _path, (item, size) = self._lru.popitem(last=False)
+            self.total -= size
+            item.drop_preview()
 
 
 class WatermarkApp:
@@ -62,16 +129,15 @@ class WatermarkApp:
         self.started = False
         self.writing = False
 
-        self.image_paths = []
+        self.items: list[ImageItem] = []
         self.index = 0
-        self.settings = {}
         self.current_position = 'bottom-right'
+        self._cache = PreviewCache(PREVIEW_CACHE_BYTES)
 
         self.watermark_img = None
-        self.base_img = None
-        self.composite = None
         self._photo = None
-        self._thumbs = []
+        self._photo_source = None
+        self._photo_size = None
         self._carousel_items = []
         self._btn_bg = None
         self._btn_fg = None
@@ -256,13 +322,20 @@ class WatermarkApp:
         btn.grid(row=row, column=2, padx=(0, 4))
         self.config_widgets.extend([entry, btn])
 
+    def _current_item(self) -> ImageItem | None:
+        if 0 <= self.index < len(self.items):
+            return self.items[self.index]
+        return None
+
     def _on_scale_var(self, *_args):
         self._on_scale()
 
     def _on_scale(self, _value=None):
         self.scale_label.config(text=f'{self.scale_var.get()}%')
-        if not self._loading and self.state == 'working' and self.image_paths:
-            self.settings[self.image_paths[self.index]]['scale'] = self._scale()
+        item = self._current_item()
+        if not self._loading and self.state == 'working' and item is not None:
+            item.scale = self._scale()
+            item.drop_composite()
         self._schedule_preview()
 
     def _scale_down(self):
@@ -274,8 +347,15 @@ class WatermarkApp:
     def _set_scale_value(self, value):
         self.scale_var.set(max(SCALE_MIN, min(SCALE_MAX, value)))
 
+    def _cancel_timers(self):
+        for attr in ('_after_id', '_nav_after_id'):
+            pending = getattr(self, attr)
+            if pending is not None:
+                self.root.after_cancel(pending)
+                setattr(self, attr, None)
+
     def _schedule_preview(self):
-        if self._loading or self.state != 'working' or self.base_img is None:
+        if self._loading or self.state != 'working' or not self.items:
             return
         if self._after_id is not None:
             self.root.after_cancel(self._after_id)
@@ -283,8 +363,15 @@ class WatermarkApp:
 
     def _apply_scale_preview(self):
         self._after_id = None
-        if self.state == 'working' and self.base_img is not None:
+        if self.state == 'working':
             self._rebuild_composite()
+
+    def _schedule_nav_preview(self):
+        if self.state != 'working' or not self.items:
+            return
+        if self._nav_after_id is not None:
+            self.root.after_cancel(self._nav_after_id)
+        self._nav_after_id = self.root.after(NAV_DEBOUNCE_MS, self._load_current_image)
 
     def _scale(self):
         return self.scale_var.get() / 100
@@ -318,9 +405,11 @@ class WatermarkApp:
     def _set_position(self, position):
         self.current_position = position
         self._highlight_position(position)
-        if not self._loading and self.state == 'working' and self.image_paths:
-            self.settings[self.image_paths[self.index]]['position'] = position
-        if self.state == 'working' and self.base_img is not None:
+        item = self._current_item()
+        if not self._loading and self.state == 'working' and item is not None:
+            item.position = position
+        if self.state == 'working' and item is not None:
+            self._cancel_timers()
             self._rebuild_composite()
         if self.state == 'working':
             self.carousel_canvas.focus_set()
@@ -335,47 +424,43 @@ class WatermarkApp:
                            activebackground=self._btn_bg, activeforeground=self._btn_fg)
 
     def _load_thumbnails(self):
-        self._thumbs = []
-        for path in self.image_paths:
+        for item in self.items:
             try:
-                with Image.open(path) as img:
-                    thumb = img.convert('RGB')
-                    thumb.thumbnail(THUMB_MAX, Image.Resampling.LANCZOS)
-                    self._thumbs.append(ImageTk.PhotoImage(thumb))
+                thumb = core.load_thumbnail(item.path, THUMB_MAX).convert('RGB')
+                item.thumb = ImageTk.PhotoImage(thumb)
             except Exception:
-                self._thumbs.append(None)
+                item.thumb = None
 
     def _build_carousel_items(self):
         for child in self.carousel_inner.winfo_children():
             child.destroy()
         self._carousel_items = []
 
-        for i, path in enumerate(self.image_paths):
-            item = tk.Frame(self.carousel_inner, bd=2, relief='flat', bg=ITEM_BG, cursor='hand2')
-            item.pack(fill='x', padx=4, pady=3)
+        for i, item in enumerate(self.items):
+            frame = tk.Frame(self.carousel_inner, bd=2, relief='flat', bg=ITEM_BG, cursor='hand2')
+            frame.pack(fill='x', padx=4, pady=3)
 
-            thumb = self._thumbs[i]
-            thumb_label = tk.Label(item, bg=ITEM_BG)
-            if thumb is not None:
-                thumb_label.config(image=thumb)
+            thumb_label = tk.Label(frame, bg=ITEM_BG)
+            if item.thumb is not None:
+                thumb_label.config(image=item.thumb)
             else:
                 thumb_label.config(text='?', width=16, height=4, fg='#999999')
             thumb_label.pack(pady=(2, 0))
 
-            name = path.name
+            name = item.path.name
             if len(name) > 26:
-                name = path.stem[:20] + '…' + path.suffix
+                name = item.path.stem[:20] + '…' + item.path.suffix
             caption = tk.Label(
-                item, text=f'{i + 1:04d}  {name}', bg=ITEM_BG, fg='#333333',
+                frame, text=f'{i + 1:04d}  {name}', bg=ITEM_BG, fg='#333333',
                 font=('', 8), wraplength=CAROUSEL_WIDTH - 36, justify='center',
             )
             caption.pack(fill='x', pady=(0, 2))
 
-            for widget in (item, thumb_label, caption):
+            for widget in (frame, thumb_label, caption):
                 widget.bind('<Button-1>', lambda _e, idx=i: self._on_item_click(idx))
                 self._bind_wheel(widget)
 
-            self._carousel_items.append({'frame': item, 'thumb': thumb_label, 'caption': caption})
+            self._carousel_items.append({'frame': frame, 'thumb': thumb_label, 'caption': caption})
 
         self._highlight_item()
 
@@ -409,9 +494,9 @@ class WatermarkApp:
             self.carousel_canvas.yview_moveto((y + height - view_height) / total)
 
     def _select(self, idx, focus=True):
-        if not self.image_paths:
+        if not self.items:
             return
-        self.index = max(0, min(len(self.image_paths) - 1, idx))
+        self.index = max(0, min(len(self.items) - 1, idx))
         self._highlight_item()
         self._scroll_to_selected()
         self._load_controls_for_current()
@@ -421,21 +506,41 @@ class WatermarkApp:
         if focus:
             self.carousel_canvas.focus_set()
 
-    def _schedule_nav_preview(self):
-        if self.state != 'working':
-            return
-        if self._nav_after_id is not None:
-            self.root.after_cancel(self._nav_after_id)
-        self._nav_after_id = self.root.after(NAV_DEBOUNCE_MS, self._load_current_image)
-
     def _load_controls_for_current(self):
-        config = self.settings[self.image_paths[self.index]]
+        item = self._current_item()
+        if item is None:
+            return
         self._loading = True
-        self.scale_var.set(int(round(config['scale'] * 100)))
+        self.scale_var.set(int(round(item.scale * 100)))
         self.scale_label.config(text=f'{self.scale_var.get()}%')
-        self.current_position = config['position']
+        self.current_position = item.position
         self._highlight_position(self.current_position)
         self._loading = False
+
+    def _ensure_base(self, item: ImageItem) -> Image.Image:
+        if item.base_preview is None:
+            item.base_preview = core.load_thumbnail(item.path, (PREVIEW_MAX, PREVIEW_MAX))
+        return item.base_preview
+
+    def _ensure_preview(self, item: ImageItem) -> Image.Image:
+        key = (item.position, item.scale)
+        if item.preview is not None and item.preview_key == key:
+            self._cache.touch(item)
+            return item.preview
+
+        base = self._ensure_base(item)
+        ratio = 1.0
+        if item.width and base.width:
+            ratio = min(1.0, base.width / item.width)
+        item.preview = core.apply_watermark(
+            base, self.watermark_img, item.position, item.scale, shadow_scale=ratio
+        ).convert('RGB')
+        item.preview_key = key
+        self._cache.touch(item)
+        return item.preview
+
+    def _invalidate_preview(self, item: ImageItem):
+        item.drop_composite()
 
     def _nav(self, delta):
         if self.state != 'working':
@@ -447,14 +552,9 @@ class WatermarkApp:
         if self.state != 'working':
             return 'break'
         target = self.index + delta
-        if target < 0 or target >= len(self.image_paths):
+        if target < 0 or target >= len(self.items):
             return 'break'
-        self.image_paths[self.index], self.image_paths[target] = (
-            self.image_paths[target], self.image_paths[self.index],
-        )
-        self._thumbs[self.index], self._thumbs[target] = (
-            self._thumbs[target], self._thumbs[self.index],
-        )
+        self.items[self.index], self.items[target] = self.items[target], self.items[self.index]
         self.index = target
         self._build_carousel_items()
         self._scroll_to_selected()
@@ -476,24 +576,20 @@ class WatermarkApp:
         return 'break'
 
     def _discard_selected(self):
-        if self.state != 'working' or not self.image_paths:
+        if self.state != 'working' or not self.items:
             return
         idx = self.index
-        path = self.image_paths[idx]
-        self._discarded_stack.append((idx, path, dict(self.settings[path]), self._thumbs[idx]))
-        del self.image_paths[idx]
-        del self.settings[path]
-        del self._thumbs[idx]
+        item = self.items[idx]
+        self._discarded_stack.append((idx, item))
+        del self.items[idx]
+        self._cache.remove(item)
         self._build_carousel_items()
 
-        if self.image_paths:
-            self._select(min(idx, len(self.image_paths) - 1))
-            self._set_status(f'Descartada: {path.name}  (Ctrl+Z para deshacer)')
+        if self.items:
+            self._select(min(idx, len(self.items) - 1))
+            self._set_status(f'Descartada: {item.path.name}  (Ctrl+Z para deshacer)')
         else:
             self.index = 0
-            self.base_img = None
-            self.composite = None
-            self._refresh_info()
             self._render_preview()
             self._set_status('No quedan imágenes. Ctrl+Z para deshacer o Cancelar.', error=True)
         self._update_buttons()
@@ -501,25 +597,11 @@ class WatermarkApp:
     def _undo_discard(self):
         if self.state != 'working' or not self._discarded_stack:
             return
-        idx, path, config, thumb = self._discarded_stack.pop()
-        idx = max(0, min(idx, len(self.image_paths)))
-        self.image_paths.insert(idx, path)
-        self.settings[path] = config
-        self._thumbs.insert(idx, thumb)
+        idx, item = self._discarded_stack.pop()
+        idx = max(0, min(idx, len(self.items)))
+        self.items.insert(idx, item)
         self._build_carousel_items()
         self._select(idx)
-        self._set_status(f'Restaurada: {path.name}')
-        self._update_buttons()
-
-    def _update_buttons(self):
-        working = self.state == 'working'
-        has_images = bool(self.image_paths)
-        self.up_btn.config(state='normal' if working and self.index > 0 else 'disabled')
-        self.down_btn.config(
-            state='normal' if working and self.index < len(self.image_paths) - 1 else 'disabled'
-        )
-        self.discard_btn.config(state='normal' if working and has_images else 'disabled')
-        self.write_btn.config(state='normal' if working and has_images else 'disabled')
 
     def _on_start(self):
         src = self.src_var.get().strip()
@@ -552,14 +634,25 @@ class WatermarkApp:
             )
 
         self.dest_dir = dest_dir
-        self.image_paths = list(images)
-        self.index = 0
         default_position = self.current_position
         default_scale = self._scale()
-        self.settings = {
-            path: {'position': default_position, 'scale': default_scale}
-            for path in self.image_paths
-        }
+        items = []
+        for path in images:
+            try:
+                with Image.open(path) as img:
+                    width, height = img.size
+            except Exception:
+                width, height = 0, 0
+            items.append(ImageItem(
+                path=path, position=default_position, scale=default_scale,
+                width=width, height=height,
+            ))
+        self.items = items
+        self.index = 0
+        self._cache.clear()
+        self._photo = None
+        self._photo_source = None
+        self._photo_size = None
         self.started = True
         self.writing = False
         self._cancel_requested = False
@@ -570,40 +663,44 @@ class WatermarkApp:
         self.state = 'working'
         self._set_ui_state('working')
         self._select(0)
-        if self._nav_after_id is not None:
-            self.root.after_cancel(self._nav_after_id)
-            self._nav_after_id = None
+        self._cancel_timers()
         self._load_current_image()
         self._set_status(
-            f'{len(self.image_paths)} imagen(es). Reordená con Ctrl+↑/↓ o los botones, '
+            f'{len(self.items)} imagen(es). Reordená con Ctrl+↑/↓ o los botones, '
             'y escribí todo cuando estés listo.',
         )
 
     def _load_current_image(self):
         self._nav_after_id = None
-        path = self.image_paths[self.index]
+        item = self._current_item()
+        if item is None or self.watermark_img is None:
+            self._render_preview()
+            return
         try:
-            self.base_img = core.load_image(path)
+            self._ensure_preview(item)
         except Exception as exc:
-            self.base_img = None
-            self.composite = None
-            self._set_status(f'No se pudo abrir {path.name}: {exc}', error=True)
-        self._rebuild_composite()
+            item.preview = None
+            self._set_status(f'Error al aplicar la marca: {exc}', error=True)
+        self._render_preview()
 
     def _rebuild_composite(self):
-        if self.base_img is not None and self.watermark_img is not None:
-            try:
-                self.composite = core.apply_watermark(
-                    self.base_img, self.watermark_img, self.current_position, self._scale()
-                )
-            except Exception as exc:
-                self.composite = None
-                self._set_status(f'Error al aplicar la marca: {exc}', error=True)
+        item = self._current_item()
+        if item is None or self.watermark_img is None:
+            self._render_preview()
+            return
+        self._invalidate_preview(item)
+        try:
+            self._ensure_preview(item)
+        except Exception as exc:
+            item.preview = None
+            self._set_status(f'Error al aplicar la marca: {exc}', error=True)
         self._render_preview()
 
     def _render_preview(self):
         self.canvas.delete('all')
-        if self.composite is None:
+        item = self._current_item()
+        preview = item.preview if item is not None else None
+        if preview is None:
             w = self.canvas.winfo_width()
             h = self.canvas.winfo_height()
             if w > 1 and h > 1:
@@ -614,32 +711,36 @@ class WatermarkApp:
 
         box_w = max(self.canvas.winfo_width(), 200)
         box_h = max(self.canvas.winfo_height(), 200)
-        img = self.composite.convert('RGB')
-        ratio = min(box_w / img.width, box_h / img.height, 1.0)
-        if ratio < 1.0:
-            new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
 
-        self._photo = ImageTk.PhotoImage(img)
+        if self._photo_source is not preview or self._photo_size != (box_w, box_h):
+            img = preview
+            ratio = min(box_w / img.width, box_h / img.height, 1.0)
+            if ratio < 1.0:
+                new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            self._photo = ImageTk.PhotoImage(img)
+            self._photo_source = preview
+            self._photo_size = (box_w, box_h)
+
         self.canvas.create_image(box_w // 2, box_h // 2, image=self._photo)
 
     def _refresh_info(self):
-        if not self.image_paths:
+        item = self._current_item()
+        if item is None:
             self.filename_var.set('—')
             self.counter_var.set('')
             return
-        path = self.image_paths[self.index]
-        self.counter_var.set(f'Imagen {self.index + 1}/{len(self.image_paths)}')
-        self.filename_var.set(core.output_filename(path, self.index + 1))
+        self.counter_var.set(f'Imagen {self.index + 1}/{len(self.items)}')
+        self.filename_var.set(core.output_filename(item.path, self.index + 1))
 
     def _write_all(self):
-        if self.state != 'working' or not self.image_paths:
+        if self.state != 'working' or not self.items:
             return
 
         self._modal_open = True
         confirmed = messagebox.askyesno(
             'Aplicar y escribir todo',
-            f'Se van a escribir {len(self.image_paths)} imagen(es) en:\n{self.dest_dir}\n\n¿Continuar?',
+            f'Se van a escribir {len(self.items)} imagen(es) en:\n{self.dest_dir}\n\n¿Continuar?',
         )
         self._modal_open = False
         self.carousel_canvas.focus_set()
@@ -660,25 +761,22 @@ class WatermarkApp:
             return
 
         self.progress.grid()
-        self.progress['maximum'] = len(self.image_paths)
+        self.progress['maximum'] = len(self.items)
         self.progress['value'] = 0
         ok = 0
         errors = []
 
-        for i, path in enumerate(self.image_paths):
+        for i, item in enumerate(self.items):
             if self._cancel_requested:
                 break
-            config = self.settings[path]
             try:
-                base = core.load_image(path)
-                comp = core.apply_watermark(
-                    base, self.watermark_img, config['position'], config['scale']
-                )
-                name = core.output_filename(path, i + 1)
+                base = core.load_image(item.path)
+                comp = core.apply_watermark(base, self.watermark_img, item.position, item.scale)
+                name = core.output_filename(item.path, i + 1)
                 core.save_image(comp, self.dest_dir / name)
                 ok += 1
             except Exception as exc:
-                errors.append(f'{path.name}: {exc}')
+                errors.append(f'{item.path.name}: {exc}')
             self.progress['value'] = i + 1
             self.root.update()
 
@@ -712,13 +810,13 @@ class WatermarkApp:
         self.writing = False
         self.started = False
         self.progress.grid_remove()
-        self.base_img = None
-        self.composite = None
-        self.image_paths = []
-        self.settings = {}
-        self._thumbs = []
-        self._discarded_stack = []
+        self.items = []
         self.index = 0
+        self._cache.clear()
+        self._photo = None
+        self._photo_source = None
+        self._photo_size = None
+        self._discarded_stack = []
         self._build_carousel_items()
         self.filename_var.set('—')
         self.counter_var.set('')
@@ -731,11 +829,7 @@ class WatermarkApp:
         nav_on = state == 'working'
         config_on = state in ('idle', 'done')
 
-        for attr in ('_after_id', '_nav_after_id'):
-            pending = getattr(self, attr)
-            if pending is not None:
-                self.root.after_cancel(pending)
-                setattr(self, attr, None)
+        self._cancel_timers()
 
         for widget in self.config_widgets:
             widget.config(state='normal' if config_on else 'disabled')
@@ -758,6 +852,16 @@ class WatermarkApp:
         self._highlight_position(self.current_position)
         self._highlight_item()
         self._update_buttons()
+
+    def _update_buttons(self):
+        working = self.state == 'working'
+        has_images = bool(self.items)
+        self.up_btn.config(state='normal' if working and self.index > 0 else 'disabled')
+        self.down_btn.config(
+            state='normal' if working and self.index < len(self.items) - 1 else 'disabled'
+        )
+        self.discard_btn.config(state='normal' if working and has_images else 'disabled')
+        self.write_btn.config(state='normal' if working and has_images else 'disabled')
 
     def _set_status(self, text, error=False):
         self.status_var.set(text)

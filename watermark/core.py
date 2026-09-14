@@ -102,11 +102,23 @@ def load_watermark(path: Path) -> Image.Image:
         return wm.convert('RGBA').copy()
 
 
+def load_thumbnail(path: Path, max_size) -> Image.Image:
+    with Image.open(path) as img:
+        try:
+            img.draft('RGB', max_size)
+        except Exception:
+            pass
+        thumb = img.convert('RGBA')
+        thumb.thumbnail(max_size, Image.Resampling.LANCZOS)
+        return thumb.copy()
+
+
 def apply_watermark(
     base_image: Image.Image,
     watermark: Image.Image,
     position: str = 'bottom-right',
     scale: float = DEFAULT_SCALE,
+    shadow_scale: float = 1.0,
 ) -> Image.Image:
     if position not in POSITIONS:
         raise ValueError(f"Posición inválida: {position!r}. Válidas: {', '.join(POSITIONS)}")
@@ -119,7 +131,12 @@ def apply_watermark(
     target_wm_height = max(1, int(target_wm_width * aspect_ratio))
     wm = wm.resize((target_wm_width, target_wm_height), Image.Resampling.LANCZOS)
 
-    wm_shadowed, padding = add_drop_shadow(wm, offset=SHADOW_OFFSET, blur_radius=SHADOW_BLUR_RADIUS)
+    offset = (
+        max(1, round(SHADOW_OFFSET[0] * shadow_scale)),
+        max(1, round(SHADOW_OFFSET[1] * shadow_scale)),
+    )
+    blur_radius = max(1, round(SHADOW_BLUR_RADIUS * shadow_scale))
+    wm_shadowed, padding = add_drop_shadow(wm, offset=offset, blur_radius=blur_radius)
 
     anchor = (wm_shadowed.width - padding, wm_shadowed.height - padding)
     pos_x, pos_y = _compute_position(img.size, anchor, position)
